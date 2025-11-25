@@ -27,7 +27,7 @@ See the [upsampling guide](docs/flux2_with_prompt_upsampling.md) for additional 
 
 ## `FLUX.2` autoencoder
 
-The FLUX.2 autoencoder has considerably improved over the [FLUX.1 autoencoder](https://huggingface.co/black-forest-labs/FLUX.1-dev/blob/main/ae.safetensors). The autoencoder is released under [Apache 2.0](https://huggingface.co/datasets/choosealicense/licenses/blob/main/markdown/apache-2.0.md) and can be found [here](https://huggingface.co/black-forest-labs/FLUX.2-dev/blob/main/ae.safetensors). For more information, see our [technical blogpost](https://bfl.ai/blog/flux-2).
+The FLUX.2 autoencoder has considerably improved over the [FLUX.1 autoencoder](https://huggingface.co/black-forest-labs/FLUX.1-dev/blob/main/ae.safetensors). The autoencoder is released under [Apache 2.0](https://huggingface.co/datasets/choosealicense/licenses/blob/main/markdown/apache-2.0.md) and can be found [here](https://huggingface.co/black-forest-labs/FLUX.2-dev/blob/main/ae.safetensors). For more information, see our [technical blogpost](https://bfl.ai/research/representation-comparison).
 
 ## Local installation
 
@@ -135,7 +135,7 @@ If you find the provided code or models useful for your research, consider citin
 ```bib
 @misc{flux-2-2025,
     author={Black Forest Labs},
-    title={{FLUX.2: State-of-the-Art Visual Intelligence}},
+    title={{FLUX.2: Frontier Visual Intelligence}},
     year={2025},
     howpublished={\url{https://bfl.ai/blog/flux-2}},
 }

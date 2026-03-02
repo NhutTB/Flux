@@ -109,6 +109,69 @@ def load_flow_model(model_name: str, debug_mode: bool = False, device: str | tor
             return Flux2(FLUX2_MODEL_INFO[model_name.lower()]["params"]).to(torch.bfloat16)
 
 
+def load_flow_model_inpaint(
+    model_name: str,
+    debug_mode: bool = False,
+    device: str | torch.device = "cuda",
+) -> Flux2:
+    """
+    Load a FLUX.2 model with extended img_in for inpainting
+    (channel-concatenation: +1 mask channel + in_channels masked_image_latent).
+
+    Pretrained weights are loaded first, then the img_in linear layer is
+    extended with zero-initialized columns so the model initially ignores
+    the new channels (avoids catastrophic forgetting).
+    """
+    import copy
+
+    config = FLUX2_MODEL_INFO[model_name.lower()]
+    params = copy.deepcopy(config["params"])
+    original_in_channels = params.in_channels  # 128
+
+    # Enable inpaint mode: extra channels = 1 (mask) + 128 (masked_image_latent)
+    params.inpaint_in_channels = original_in_channels + 1  # 129
+
+    if debug_mode:
+        params.depth = 1
+        params.depth_single_blocks = 1
+        with torch.device(device):
+            return Flux2(params).to(torch.bfloat16)
+
+    # 1) Load pretrained weights into a standard (non-inpaint) model
+    if config["model_path"] in os.environ:
+        weight_path = os.environ[config["model_path"]]
+    else:
+        weight_path = huggingface_hub.hf_hub_download(
+            repo_id=config["repo_id"],
+            filename=config["filename"],
+            repo_type="model",
+        )
+
+    sd = load_sft(weight_path, device=str(device))
+
+    # 2) Extend img_in.weight: [hidden_size, 128] → [hidden_size, 257]
+    old_weight = sd["img_in.weight"]  # [hidden_size, original_in_channels]
+    hidden_size = old_weight.shape[0]
+    new_in_dim = original_in_channels + params.inpaint_in_channels  # 128+129=257
+    new_weight = torch.zeros(
+        hidden_size, new_in_dim, device=old_weight.device, dtype=old_weight.dtype
+    )
+    new_weight[:, :original_in_channels] = old_weight  # copy pretrained
+    # Columns original_in_channels:new_in_dim remain zero → model ignores them initially
+    sd["img_in.weight"] = new_weight
+
+    # 3) Create inpaint model and load extended state dict
+    with torch.device("meta"):
+        model = Flux2(params).to(torch.bfloat16)
+
+    model.load_state_dict(sd, strict=True, assign=True)
+    print(
+        f"Loaded inpaint model: img_in {original_in_channels} → {new_in_dim} channels "
+        f"(+1 mask, +{original_in_channels} masked_image_latent, zero-initialized)"
+    )
+    return model.to(device)
+
+
 def load_text_encoder(model_name: str, device: str | torch.device = "cuda"):
     config = FLUX2_MODEL_INFO[model_name.lower()]
     return config["text_encoder_load_fn"](device=device)

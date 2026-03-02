@@ -13,6 +13,7 @@ from transformers import (
 )
 
 from .sampling import cap_pixels, concatenate_images
+from .system_messages import SYSTEM_MESSAGE_UPSAMPLING_T2I, SYSTEM_MESSAGE_UPSAMPLING_INPAINT
 from .system_messages import (
     PROMPT_IMAGE_INTEGRITY,
     PROMPT_IMAGE_INTEGRITY_FOLLOW_UP,
@@ -394,6 +395,10 @@ class Qwen3Embedder(nn.Module):
                 enable_thinking=False,
             )
 
+            # apply_chat_template may return a list in some transformers versions
+            if isinstance(text, list):
+                text = text[0]
+
             model_inputs = self.tokenizer(
                 text,
                 return_tensors="pt",
@@ -424,8 +429,75 @@ class Qwen3Embedder(nn.Module):
     def test_image(self, image) -> bool:
         raise NotImplementedError("Qwen3Embedder does not support image testing")
 
-    def upsample_prompt(self, txt: list[str], img=None, **kwargs) -> list[str]:
-        raise NotImplementedError("Qwen3Embedder does not support upsampling")
+    @torch.no_grad()
+    def upsample_prompt(
+        self,
+        txt: list[str],
+        img=None,
+        is_editing: bool = False,
+        temperature: float = 0.15,
+        **kwargs,
+    ) -> list[str]:
+        """
+        Upsample (enrich) prompts using the already-loaded Qwen3 model.
+        No extra VRAM needed — reuses the same model used for embeddings.
+
+        Args:
+            txt: List of short prompts to upsample.
+            img: Ignored (Qwen3 text-only, no image support).
+            is_editing: If True, use I2I system message (focus on edit target).
+                        If False, use T2I system message (full scene description).
+            temperature: Sampling temperature (lower = more deterministic).
+
+        Returns:
+            List of enriched, detailed prompts.
+        """
+        system_msg = SYSTEM_MESSAGE_UPSAMPLING_INPAINT if is_editing else SYSTEM_MESSAGE_UPSAMPLING_T2I
+        upsampled = []
+
+        for prompt in txt:
+            messages = [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": prompt},
+            ]
+            text = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+            if isinstance(text, list):
+                text = text[0]
+
+            model_inputs = self.tokenizer(
+                text,
+                return_tensors="pt",
+            ).to(self.model.device)
+
+            try:
+                generated_ids = self.model.generate(
+                    **model_inputs,
+                    max_new_tokens=512,
+                    do_sample=True,
+                    temperature=temperature,
+                    use_cache=True,
+                )
+
+                # Decode only the newly generated tokens
+                input_length = model_inputs["input_ids"].shape[1]
+                new_tokens = generated_ids[:, input_length:]
+                result = self.tokenizer.batch_decode(
+                    new_tokens,
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=True,
+                )[0].strip()
+
+                upsampled.append(result if result else prompt)
+            except Exception as e:
+                print(f"Error upsampling prompt: {e}, returning original")
+                upsampled.append(prompt)
+
+        return upsampled
 
 
 def load_mistral_small_embedder(device: str | torch.device = "cuda") -> Mistral3SmallEmbedder:

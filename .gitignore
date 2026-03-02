@@ -230,3 +230,10 @@ $RECYCLE.BIN/
 # End of https://www.toptal.com/developers/gitignore/api/linux,windows,macos,visualstudiocode,python
 
 output/
+
+# ML models
+*.safetensors
+*.ckpt
+*.pth
+*.bin
+weights/

@@ -1,6 +1,7 @@
 import math
 
 import torch
+import torch.nn.functional as F
 import torchvision
 from einops import rearrange
 from PIL import Image
@@ -307,6 +308,75 @@ def denoise(
     return img
 
 
+def denoise_with_mask_blending(
+    model: Flux2,
+    img: Tensor,
+    img_ids: Tensor,
+    txt: Tensor,
+    txt_ids: Tensor,
+    mask_tokens: Tensor,
+    image_latent_tokens: Tensor,
+    noise_tokens: Tensor,
+    timesteps: list[float],
+    guidance: float,
+    img_cond_seq: Tensor | None = None,
+    img_cond_seq_ids: Tensor | None = None,
+):
+    """
+    Denoising loop with latent-space mask blending (RePaint/SDEdit style).
+    Works with the STANDARD model — no fine-tuning needed.
+
+    At each step:
+      1. Replace unmasked region with correctly-noised original
+      2. Model predicts velocity for the full image
+      3. Euler step update
+
+    Args:
+        mask_tokens:         [B, N, 1]  flattened mask (1=edit, 0=keep)
+        image_latent_tokens: [B, N, C]  flattened clean image latent
+        noise_tokens:        [B, N, C]  the SAME initial noise used to create img
+    """
+    guidance_vec = torch.full(
+        (img.shape[0],), guidance, device=img.device, dtype=img.dtype
+    )
+
+    for t_curr, t_prev in zip(timesteps[:-1], timesteps[1:]):
+        t_vec = torch.full(
+            (img.shape[0],), t_curr, dtype=img.dtype, device=img.device
+        )
+
+        # Replace unmasked region with noised original at current timestep
+        # FLUX convention: schedule 1.0→0.0, t=1 is noise, t=0 is clean
+        # So: x_t = t * noise + (1-t) * clean
+        noised_original = t_curr * noise_tokens + (1.0 - t_curr) * image_latent_tokens
+        img = mask_tokens * img + (1.0 - mask_tokens) * noised_original
+
+        img_input = img
+        img_input_ids = img_ids
+        if img_cond_seq is not None:
+            assert img_cond_seq_ids is not None
+            img_input = torch.cat((img_input, img_cond_seq), dim=1)
+            img_input_ids = torch.cat((img_input_ids, img_cond_seq_ids), dim=1)
+
+        pred = model(
+            x=img_input,
+            x_ids=img_input_ids,
+            timesteps=t_vec,
+            ctx=txt,
+            ctx_ids=txt_ids,
+            guidance=guidance_vec,
+        )
+
+        if img_cond_seq is not None:
+            pred = pred[:, : img.shape[1]]
+
+        img = img + (t_prev - t_curr) * pred
+
+    # Final: ensure unmasked region is exactly clean original
+    img = mask_tokens * img + (1.0 - mask_tokens) * image_latent_tokens
+    return img
+
+
 def vanilla_guidance(x: torch.Tensor, cfg_val: float) -> torch.Tensor:
     x_u, x_c = x.chunk(2)
     x = x_u + cfg_val * (x_c - x_u)
@@ -360,6 +430,296 @@ def denoise_cfg(
         img = img + (t_prev - t_curr) * pred
 
     return img.chunk(2)[0]
+
+
+# ── Inpainting helpers ────────────────────────────────────────────────────
+
+
+def prepare_mask_latent(
+    mask: Tensor,
+    latent_h: int,
+    latent_w: int,
+) -> Tensor:
+    """
+    Downsample a binary mask to latent spatial dimensions.
+
+    Args:
+        mask: [B, 1, H, W] binary mask in pixel space (1=edit, 0=keep).
+        latent_h: Height in latent space.
+        latent_w: Width  in latent space.
+
+    Returns:
+        mask_latent: [B, 1, latent_h, latent_w] float mask in latent space.
+    """
+    original_dtype = mask.dtype
+    mask_latent = F.interpolate(
+        mask.float(),
+        size=(latent_h, latent_w),
+        mode="nearest",
+    )
+    return mask_latent.to(original_dtype)
+
+
+def prepare_inpaint_latent(
+    noisy_latent: Tensor,
+    mask_latent: Tensor,
+    image_latent: Tensor,
+) -> Tensor:
+    """
+    Concatenate noisy latent + mask + masked_image_latent along the channel
+    dimension, producing the full inpaint input.
+
+    Args:
+        noisy_latent:  [B, C, H, W]  – the current noisy sample  (C=128)
+        mask_latent:   [B, 1, H, W]  – binary mask in latent space
+        image_latent:  [B, C, H, W]  – encoded clean image latent (C=128)
+
+    Returns:
+        concat:  [B, 2*C+1, H, W]  (e.g. 257 channels)
+    """
+    # Zero out inpaint region so model sees clean context outside mask
+    masked_image_latent = image_latent * (1.0 - mask_latent)
+    return torch.cat([noisy_latent, mask_latent, masked_image_latent], dim=1)
+
+
+def denoise_inpaint(
+    model: Flux2,
+    # model input
+    img: Tensor,
+    img_ids: Tensor,
+    txt: Tensor,
+    txt_ids: Tensor,
+    # inpaint conditioning (all in *flattened-token* space already prc_img'd)
+    mask_tokens: Tensor,
+    image_latent_tokens: Tensor,
+    # sampling parameters
+    timesteps: list[float],
+    guidance: float,
+    # extra img tokens (reference images)
+    img_cond_seq: Tensor | None = None,
+    img_cond_seq_ids: Tensor | None = None,
+):
+    """
+    Denoising loop for channel-concatenation inpainting.
+
+    At every step the model receives  [noisy_tokens | mask_tokens | masked_image_tokens]
+    concatenated along the *channel* (last) dimension of the token sequence.
+
+    Args:
+        img:                 [B, N, C]     – noisy latent tokens (N = h*w, C = 128)
+        img_ids:             [B, N, 4]     – positional ids
+        txt / txt_ids:       text embeddings & ids
+        mask_tokens:         [B, N, 1]     – flattened mask   (same N)
+        image_latent_tokens: [B, N, C]     – flattened clean image latent
+        timesteps:           schedule of t values
+        guidance:            guidance scale
+        img_cond_seq / ids:  optional reference image tokens
+    """
+    guidance_vec = torch.full(
+        (img.shape[0],), guidance, device=img.device, dtype=img.dtype
+    )
+
+    # Pre-compute masked image tokens (zero-out edit region)
+    masked_image_tokens = image_latent_tokens * (1.0 - mask_tokens)
+
+    for t_curr, t_prev in zip(timesteps[:-1], timesteps[1:]):
+        t_vec = torch.full(
+            (img.shape[0],), t_curr, dtype=img.dtype, device=img.device
+        )
+
+        # Build inpaint input: concat along channel dim
+        # img: [B, N, 128], mask_tokens: [B, N, 1], masked: [B, N, 128]
+        # → inpaint_input: [B, N, 257]
+        inpaint_input = torch.cat(
+            [img, mask_tokens, masked_image_tokens], dim=-1
+        )
+
+        img_input = inpaint_input
+        img_input_ids = img_ids
+        if img_cond_seq is not None:
+            assert img_cond_seq_ids is not None
+            # Pad reference tokens to match inpaint channel width (257)
+            pad_width = inpaint_input.shape[-1] - img_cond_seq.shape[-1]
+            if pad_width > 0:
+                ref_pad = torch.zeros(
+                    img_cond_seq.shape[0],
+                    img_cond_seq.shape[1],
+                    pad_width,
+                    device=img_cond_seq.device,
+                    dtype=img_cond_seq.dtype,
+                )
+                img_cond_seq_padded = torch.cat(
+                    [img_cond_seq, ref_pad], dim=-1
+                )
+            else:
+                img_cond_seq_padded = img_cond_seq
+            img_input = torch.cat((img_input, img_cond_seq_padded), dim=1)
+            img_input_ids = torch.cat((img_input_ids, img_cond_seq_ids), dim=1)
+
+        pred = model(
+            x=img_input,
+            x_ids=img_input_ids,
+            timesteps=t_vec,
+            ctx=txt,
+            ctx_ids=txt_ids,
+            guidance=guidance_vec,
+        )
+
+        # Only keep prediction for the actual image tokens
+        if img_cond_seq is not None:
+            pred = pred[:, : img.shape[1]]
+
+        img = img + (t_prev - t_curr) * pred
+
+    return img
+
+
+# ── RF-Inversion ──────────────────────────────────────────────────────────
+
+
+def invert(
+    model: Flux2,
+    img: Tensor,          # [B, N, C] clean image latent tokens (x_0)
+    img_ids: Tensor,      # [B, N, 4]
+    txt: Tensor,
+    txt_ids: Tensor,
+    timesteps: list[float],   # get_schedule() output: high→low (denoising order)
+    guidance: float,
+    gamma: float = 0.5,       # 0=pure model velocity, 1=straight line to noise
+    img_cond_seq: Tensor | None = None,
+    img_cond_seq_ids: Tensor | None = None,
+) -> list[Tensor]:
+    """
+    RF-Inversion: forward ODE từ x_0 (clean) → x_T (noise).
+
+    FLUX flow matching: x_t = (1-t)*x_0 + t*eps, nên forward ODE là:
+        dx/dt = v_θ(x_t, t)  với dt > 0 (t tăng dần từ 0→1)
+
+    gamma blending: cân bằng model velocity với straight-line path đến noise.
+        v_eff = (1-gamma)*v_model + gamma*(eps - x_0)
+        gamma=0 → pure model (edit tự do, ít bám structure)
+        gamma=1 → straight path (bám sát ảnh gốc)
+
+    Args:
+        img:       [B, N, C]  clean image latent tokens (x_0), output của ae.encode
+        timesteps: từ get_schedule() — denoising order (t_high→0).
+                   Inversion chạy NGƯỢC: 0→t_high
+
+    Returns:
+        trajectory: list[Tensor] độ dài len(timesteps).
+                    trajectory[0] = x_0 (clean)
+                    trajectory[-1] = x_T (inverted noise)
+                    trajectory[i] ↔ inv_timesteps[i] = timesteps[-(i+1)]
+    """
+    guidance_vec = torch.full((img.shape[0],), guidance, device=img.device, dtype=img.dtype)
+
+    # Sample noise target (x_T đích đến của inversion)
+    eps = torch.randn_like(img)
+
+    # Inversion chạy ngược schedule: 0.0 → t_max
+    inv_timesteps = list(reversed(timesteps))  # [0.0, ..., t_high]
+
+    trajectory = [img.clone()]  # trajectory[0] = x_0
+    x = img.clone()
+
+    for t_curr, t_next in zip(inv_timesteps[:-1], inv_timesteps[1:]):
+        t_vec = torch.full((x.shape[0],), t_curr, dtype=x.dtype, device=x.device)
+        dt = t_next - t_curr  # > 0
+
+        img_input = x
+        img_input_ids = img_ids
+        if img_cond_seq is not None:
+            assert img_cond_seq_ids is not None
+            img_input = torch.cat((img_input, img_cond_seq), dim=1)
+            img_input_ids = torch.cat((img_input_ids, img_cond_seq_ids), dim=1)
+
+        pred = model(
+            x=img_input,
+            x_ids=img_input_ids,
+            timesteps=t_vec,
+            ctx=txt,
+            ctx_ids=txt_ids,
+            guidance=guidance_vec,
+        )
+        if img_cond_seq is not None:
+            pred = pred[:, : x.shape[1]]
+
+        # Straight-line velocity: hướng từ x_0 đến eps
+        v_straight = eps - trajectory[0]
+
+        # Gamma blend
+        v_eff = (1.0 - gamma) * pred + gamma * v_straight
+
+        x = x + dt * v_eff
+        trajectory.append(x.clone())
+
+    return trajectory  # len = len(timesteps)
+
+
+def denoise_rf_inversion_inpaint(
+    model: Flux2,
+    img: Tensor,                     # [B, N, C] x_T (= trajectory[-1])
+    img_ids: Tensor,
+    txt: Tensor,
+    txt_ids: Tensor,
+    mask_tokens: Tensor,             # [B, N, 1]  1=edit, 0=keep
+    trajectory: list[Tensor],        # từ invert(), [0]=x_0 clean, [-1]=x_T
+    timesteps: list[float],          # denoising order high→low
+    guidance: float,
+    img_cond_seq: Tensor | None = None,
+    img_cond_seq_ids: Tensor | None = None,
+) -> Tensor:
+    """
+    Denoising với RF-Inversion mask blending.
+
+    Tại mỗi bước i (t đi từ t_high → 0):
+      unmasked region = trajectory[N-1-i]   (exact x_t của ảnh gốc, không approximate)
+      masked region   = current denoised x  (model generates new content)
+
+    Khác RePaint: trajectory[t] là CHÍNH XÁC x_t của ảnh gốc dưới forward ODE,
+    không phải t*noise + (1-t)*clean (approximation có thể sai với FLUX schedule).
+    """
+    guidance_vec = torch.full((img.shape[0],), guidance, device=img.device, dtype=img.dtype)
+    n = len(trajectory)  # = len(timesteps)
+
+    x = img.clone()  # bắt đầu từ x_T
+
+    for i, (t_curr, t_prev) in enumerate(zip(timesteps[:-1], timesteps[1:])):
+        # Map step → trajectory index
+        # i=0 (t_curr=t_high) → trajectory[-1] = x_T
+        # i=N-2 (t_curr≈0+)  → trajectory[1]
+        traj_idx = max(0, min(n - 1 - i, n - 1))
+        x_traj = trajectory[traj_idx].to(x.device, x.dtype)
+
+        # Blend TRƯỚC khi predict: unmasked = trajectory, masked = current x
+        x = mask_tokens * x + (1.0 - mask_tokens) * x_traj
+
+        t_vec = torch.full((x.shape[0],), t_curr, dtype=x.dtype, device=x.device)
+
+        img_input = x
+        img_input_ids = img_ids
+        if img_cond_seq is not None:
+            assert img_cond_seq_ids is not None
+            img_input = torch.cat((img_input, img_cond_seq), dim=1)
+            img_input_ids = torch.cat((img_input_ids, img_cond_seq_ids), dim=1)
+
+        pred = model(
+            x=img_input,
+            x_ids=img_input_ids,
+            timesteps=t_vec,
+            ctx=txt,
+            ctx_ids=txt_ids,
+            guidance=guidance_vec,
+        )
+        if img_cond_seq is not None:
+            pred = pred[:, : x.shape[1]]
+
+        x = x + (t_prev - t_curr) * pred
+
+    # Final: enforce unmasked = exact x_0 clean
+    x0 = trajectory[0].to(x.device, x.dtype)
+    x = mask_tokens * x + (1.0 - mask_tokens) * x0
+    return x
 
 
 def concatenate_images(

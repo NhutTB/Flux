@@ -18,6 +18,9 @@ class Flux2Params:
     theta: int = 2000
     mlp_ratio: float = 3.0
     use_guidance_embed: bool = True
+    # Inpainting: extra input channels (1 mask + in_channels masked_image_latent)
+    # Set to in_channels + 1 (e.g. 129) to enable inpainting mode
+    inpaint_in_channels: int = 0
 
 
 @dataclass
@@ -32,6 +35,7 @@ class Klein9BParams:
     theta: int = 2000
     mlp_ratio: float = 3.0
     use_guidance_embed: bool = False
+    inpaint_in_channels: int = 0
 
 
 @dataclass
@@ -46,6 +50,7 @@ class Klein4BParams:
     theta: int = 2000
     mlp_ratio: float = 3.0
     use_guidance_embed: bool = False
+    inpaint_in_channels: int = 0
 
 
 class Flux2(nn.Module):
@@ -54,6 +59,7 @@ class Flux2(nn.Module):
 
         self.in_channels = params.in_channels
         self.out_channels = params.in_channels
+        self.inpaint_in_channels = getattr(params, "inpaint_in_channels", 0)
         if params.hidden_size % params.num_heads != 0:
             raise ValueError(
                 f"Hidden size {params.hidden_size} must be divisible by num_heads {params.num_heads}"
@@ -64,7 +70,9 @@ class Flux2(nn.Module):
         self.hidden_size = params.hidden_size
         self.num_heads = params.num_heads
         self.pe_embedder = EmbedND(dim=pe_dim, theta=params.theta, axes_dim=params.axes_dim)
-        self.img_in = nn.Linear(self.in_channels, self.hidden_size, bias=False)
+        # img_in: accepts in_channels + inpaint_in_channels when in inpaint mode
+        img_in_dim = self.in_channels + self.inpaint_in_channels
+        self.img_in = nn.Linear(img_in_dim, self.hidden_size, bias=False)
         self.time_in = MLPEmbedder(in_dim=256, hidden_dim=self.hidden_size, disable_bias=True)
         self.txt_in = nn.Linear(params.context_in_dim, self.hidden_size, bias=False)
 
